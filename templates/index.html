@@ -5,12 +5,16 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Autolector - Real-time Transcription</title>
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='icon.png') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 
 <body>
     <div class="container autolector">
-        <h1>Autolector</h1>
+        <div class="header-branding">
+            <img src="{{ url_for('static', filename='icon.png') }}" alt="Autolector Logo" class="app-logo">
+            <h1>Autolector</h1>
+        </div>
         <p class="subtitle">Multimedia a Texto Sincronizado</p>
 
         <form id="upload-form" enctype="multipart/form-data">
