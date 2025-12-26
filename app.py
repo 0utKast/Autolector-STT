@@ -1,67 +1,84 @@
-from flask import Flask, request, render_template, jsonify
-import os
-import subprocess
-import uuid
-import shutil
-
-app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
-        return "No file part", 400
-    file = request.files['file']
-    if file.filename == '':
-        return "No selected file", 400
-    if file:
-        # Pre-flight checks for required CLIs
-        if shutil.which('ffmpeg') is None:
-            return "ffmpeg no está instalado o no está en el PATH", 500
-        if shutil.which('whisper') is None:
-            return "whisper (openai-whisper) no está instalado o no está en el PATH", 500
-
-        unique_filename = str(uuid.uuid4())
-        original_filename, file_extension = os.path.splitext(file.filename)
-        input_file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename + file_extension)
-        txt_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename + '.txt')
-        wav_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename + '.wav') # Path for extracted WAV if needed
-
-        file.save(input_file_path)
-        print(f"DEBUG: File saved to {input_file_path}")
-
-        audio_input_path = input_file_path # Assume input is audio by default
-
-        # Check if the input file is a video (e.g., .mp4) and needs audio extraction
-        if file_extension.lower() == '.mp4':
-            print("DEBUG: Input is MP4, extracting audio with ffmpeg...")
-
-        
 import os
 import subprocess
 import uuid
 import shutil
 import threading
+import queue
+import time
+import json
+from flask import Flask, request, render_template, jsonify, Response, send_from_directory
+from faster_whisper import WhisperModel
+import torch
+
+# Configuración del modelo Whisper
+WHISPER_MODEL_NAME = os.getenv('WHISPER_MODEL', 'base')
+device = "cuda" if torch.cuda.is_available() else "cpu"
+compute_type = "float16" if device == "cuda" else "int8"
+
+print(f"DEBUG: Loading Whisper model '{WHISPER_MODEL_NAME}' on {device} ({compute_type})...")
+model = WhisperModel(WHISPER_MODEL_NAME, device=device, compute_type=compute_type)
+print("DEBUG: Whisper model loaded successfully.")
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
+# Almacenamiento global para estados y streams
 task_statuses = {}
+task_queues = {}
+task_audio_paths = {}
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
+@app.route('/audio/<task_id>')
+def serve_audio(task_id):
+    path = task_audio_paths.get(task_id)
+    if path and os.path.exists(path):
+        return send_from_directory(os.path.dirname(path), os.path.basename(path))
+    return "Audio not found", 404
+
+@app.route('/stream/<task_id>')
+def stream_transcription(task_id):
+    print(f"DEBUG: New SSE connection request for task {task_id}")
+    def generate():
+        q = task_queues.get(task_id)
+        if not q:
+            print(f"DEBUG: SSE Task {task_id} not found")
+            yield "data: {\"error\": \"Task not found\"}\n\n"
+            return
+        
+        # Send initial connection event
+        yield "data: {\"status\": \"connected\"}\n\n"
+        print(f"DEBUG: SSE connection established for task {task_id}")
+        
+        while True:
+            try:
+                segment = q.get(timeout=30)
+                if segment == "DONE":
+                    print(f"DEBUG: SSE Task {task_id} completed")
+                    yield "data: {\"status\": \"completed\"}\n\n"
+                    break
+                if isinstance(segment, dict) and "error" in segment:
+                    print(f"DEBUG: SSE Task {task_id} error: {segment['error']}")
+                    yield f"data: {json.dumps(segment)}\n\n"
+                    break
+                
+                print(f"DEBUG: SSE Sending segment for {task_id}: {segment.get('text')[:20]}...")
+                yield f"data: {json.dumps(segment)}\n\n"
+            except queue.Empty:
+                yield ": keep-alive\n\n"
+            except Exception as e:
+                print(f"DEBUG: SSE Exception for {task_id}: {e}")
+                yield f"data: {{\"error\": \"{str(e)}\"}}\n\n"
+                break
+    
+    return Response(generate(), mimetype='text/event-stream')
+
 @app.route('/status/<task_id>')
 def get_status(task_id):
     status = task_statuses.get(task_id, {'status': 'unknown', 'transcription': None, 'error': None})
-    print(f"DEBUG: Sending status: {status['status']}")
     return jsonify(status)
 
 @app.route('/upload', methods=['POST'])
@@ -73,165 +90,78 @@ def upload_file():
         task_statuses[task_id]['status'] = 'error'
         task_statuses[task_id]['error'] = "No file part"
         return jsonify({'task_id': task_id, 'status': 'error', 'message': "No file part"}), 400
+    
     file = request.files['file']
     if file.filename == '':
         task_statuses[task_id]['status'] = 'error'
         task_statuses[task_id]['error'] = "No selected file"
         return jsonify({'task_id': task_id, 'status': 'error', 'message': "No selected file"}), 400
+
     if file:
-        # Pre-flight checks for required CLIs
         if shutil.which('ffmpeg') is None:
             task_statuses[task_id]['status'] = 'error'
-            task_statuses[task_id]['error'] = "ffmpeg no está instalado o no está en el PATH"
-            return jsonify({'task_id': task_id, 'status': 'error', 'message': "ffmpeg no está instalado o no está en el PATH"}), 500
-        if shutil.which('whisper') is None:
-            task_statuses[task_id]['status'] = 'error'
-            task_statuses[task_id]['error'] = "whisper (openai-whisper) no está instalado o no está en el PATH"
-            return jsonify({'task_id': task_id, 'status': 'error', 'message': "whisper (openai-whisper) no está instalado o no está en el PATH"}), 500
+            task_statuses[task_id]['error'] = "ffmpeg no instalado"
+            return jsonify({'task_id': task_id, 'status': 'error', 'message': "ffmpeg no instalado"}), 500
 
-        # Save the file to a temporary location before starting the thread
         unique_filename = str(uuid.uuid4())
         original_filename, file_extension = os.path.splitext(file.filename)
         temp_input_file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename + file_extension)
         file.save(temp_input_file_path)
-        print(f"DEBUG: File saved temporarily to {temp_input_file_path}")
 
-        # Run the transcription in a separate thread to avoid blocking the main Flask thread
+        task_queues[task_id] = queue.Queue()
         threading.Thread(target=process_file_for_transcription, args=(temp_input_file_path, file_extension, task_id, original_filename)).start()
 
         return jsonify({'task_id': task_id, 'status': 'processing_started'}), 202
 
 def process_file_for_transcription(input_file_path, file_extension, task_id, original_filename):
-    # This function will contain the original logic of upload_file, but will update task_statuses
-    # and handle file operations. It will not return HTTP responses directly.
-    # txt_path and wav_path need to be derived from the input_file_path
-    # Sanitize original_filename for safe use in file paths
-    sanitized_original_filename = "".join([c for c in original_filename if c.isalnum() or c in (' ', '_', '-')]).rstrip()
-    if not sanitized_original_filename: # Fallback if sanitization results in empty string
-        sanitized_original_filename = "transcription"
-
-    # Use sanitized original filename + a portion of UUID for TXT output to ensure uniqueness
-    base_filename_for_txt = f"{sanitized_original_filename}_{str(uuid.uuid4())[:8]}"
-
-    # Use sanitized original filename + a portion of UUID for TXT output to ensure uniqueness
-    
+    sanitized_name = "".join([c for c in original_filename if c.isalnum() or c in (' ', '_', '-')]).strip() or "transcription"
     base_filename = os.path.splitext(os.path.basename(input_file_path))[0]
-    wav_path = os.path.join(app.config['UPLOAD_FOLDER'], base_filename + '.wav') # Path for extracted WAV if needed
+    wav_path = os.path.join(app.config['UPLOAD_FOLDER'], base_filename + '.wav')
+    txt_path_final = os.path.join(app.config['UPLOAD_FOLDER'], f"{sanitized_name}_{str(uuid.uuid4())[:8]}.txt")
 
-    # Initialize audio_input_path
     audio_input_path = input_file_path
-    txt_path = os.path.join(app.config['UPLOAD_FOLDER'], os.path.splitext(os.path.basename(audio_input_path))[0] + '.txt')
-    txt_path_final = os.path.join(app.config['UPLOAD_FOLDER'], base_filename_for_txt + '.txt')
 
     try:
-        task_statuses[task_id]['status'] = 'file_saved' # Already saved in main thread
+        task_statuses[task_id]['status'] = 'file_saved'
 
-        # Check if the input file is a video (e.g., .mp4) and needs audio extraction
         if file_extension.lower() == '.mp4':
-            print("DEBUG: Input is MP4, extracting audio with ffmpeg...")
             task_statuses[task_id]['status'] = 'extracting_audio'
-            try:
-                subprocess.run(
-                    ['ffmpeg', '-y', '-loglevel', 'error', '-i', input_file_path, '-vn', wav_path],
-                    check=True,
-                    capture_output=True,
-                    timeout=600,
-                )
-                print("DEBUG: ffmpeg process completed.")
-                audio_input_path = wav_path # Use the extracted WAV for whisper
-                task_statuses[task_id]['status'] = 'audio_extracted'
-            except subprocess.TimeoutExpired:
-                print("DEBUG: ffmpeg timeout.")
-                task_statuses[task_id]['status'] = 'error'
-                task_statuses[task_id]['error'] = "Timeout al extraer audio con ffmpeg"
-                return
-            except subprocess.CalledProcessError as e:
-                stderr = (e.stderr or b'').decode(errors='ignore')
-                print(f"DEBUG: ffmpeg error: {stderr}")
-                task_statuses[task_id]['status'] = 'error'
-                task_statuses[task_id]['error'] = f"Error extrayendo audio (ffmpeg): {stderr}"
-                return
+            subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', input_file_path, '-vn', wav_path], check=True, timeout=600)
+            audio_input_path = wav_path
+            task_statuses[task_id]['status'] = 'audio_extracted'
+            task_audio_paths[task_id] = wav_path
         else:
-            print(f"DEBUG: Input is audio ({file_extension}), proceeding directly to whisper.")
             task_statuses[task_id]['status'] = 'ready_for_transcription'
+            task_audio_paths[task_id] = input_file_path
 
-        # Transcribe audio using whisper
-        print("DEBUG: Starting whisper process...")
         task_statuses[task_id]['status'] = 'transcribing'
-        try:
-            # Whisper will create the .txt file in the specified output directory
-            whisper_cmd = ['whisper', audio_input_path, '--output_dir', app.config['UPLOAD_FOLDER'], '--output_format', 'txt']
-            model = os.getenv('WHISPER_MODEL')
-            if model:
-                whisper_cmd += ['--model', model]
-            whisper_process = subprocess.run(
-                whisper_cmd,
-                check=True,
-                capture_output=True,
-                timeout=3600,
-            )
-            print("DEBUG: whisper process completed.")
-            print(f"Whisper STDOUT: {whisper_process.stdout.decode(errors='ignore')}")
-            print(f"Whisper STDERR: {whisper_process.stderr.decode(errors='ignore')}")
-            task_statuses[task_id]['status'] = 'transcription_completed'
-            # Rename the generated .txt file to the desired personalized name
-            if os.path.exists(txt_path):
-                os.rename(txt_path, txt_path_final)
-                print(f"DEBUG: Renamed {txt_path} to {txt_path_final}")
-        except subprocess.TimeoutExpired:
-            print("DEBUG: whisper timeout.")
-            task_statuses[task_id]['status'] = 'error'
-            task_statuses[task_id]['error'] = "Timeout transcribiendo audio con whisper (modelo puede tardar)."
-            return
-        except subprocess.CalledProcessError as e:
-            stderr = (e.stderr or b'').decode(errors='ignore')
-            print(f"DEBUG: whisper error: {stderr}")
-            task_statuses[task_id]['status'] = 'error'
-            task_statuses[task_id]['error'] = f"Error transcribiendo audio (whisper): {stderr}"
-            return
+        segments, info = model.transcribe(audio_input_path, beam_size=5)
+        
+        full_text = []
+        q = task_queues.get(task_id)
 
-        # Read the transcribed text
-        print(f"DEBUG: Attempting to read transcription from {txt_path_final}...")
-        task_statuses[task_id]['status'] = 'reading_transcription'
-        try:
-            with open(txt_path_final, 'r', encoding='utf-8') as f:
-                transcription = f.read()
-            print("DEBUG: Transcription read successfully.")
-            task_statuses[task_id]['transcription'] = transcription
-            task_statuses[task_id]['status'] = 'completed'
-        except Exception as e:
-            print(f"DEBUG: Error reading transcription file: {e}")
-            task_statuses[task_id]['status'] = 'error'
-            task_statuses[task_id]['error'] = f"Error reading transcription file: {e}"
-        finally:
-            # Clean up temporary files
-            print("DEBUG: Cleaning up temporary files...")
-            files_to_remove = [input_file_path] # The original uploaded file
-            if os.path.exists(wav_path) and audio_input_path == wav_path: # Only remove wav if it was created and used
-                files_to_remove.append(wav_path)
+        for segment in segments:
+            seg_data = {"start": segment.start, "end": segment.end, "text": segment.text}
+            full_text.append(segment.text)
+            if q: q.put(seg_data)
 
-            for p in files_to_remove:
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                        print(f"DEBUG: Removed {p}")
-                except Exception as e:
-                    print(f"DEBUG: Failed to remove {p}: {e}")
-                    # No bloquear la respuesta por fallos de borrado (Windows locks, etc.)
-                    pass
-            print("DEBUG: Temporary file cleanup completed.")
+        with open(txt_path_final, 'w', encoding='utf-8') as f:
+            f.write("".join(full_text))
 
-        print("DEBUG: Returning transcription.")
+        task_statuses[task_id]['status'] = 'completed'
+        task_statuses[task_id]['transcription'] = "".join(full_text)
+        if q: q.put("DONE")
 
     except Exception as e:
-        print(f"DEBUG: Unhandled exception in process_file_for_transcription: {e}")
+        print(f"ERROR task {task_id}: {e}")
         task_statuses[task_id]['status'] = 'error'
-        task_statuses[task_id]['error'] = f"Unhandled server error: {e}"
-
-        
+        task_statuses[task_id]['error'] = str(e)
+        q = task_queues.get(task_id)
+        if q: q.put({"error": str(e)})
+    finally:
+        # Cleanup code could go here, but for 'Autolector' we might want to keep the audio 
+        # for a while. We'll leave the file management for now.
+        pass
 
 if __name__ == '__main__':
-    debug = os.getenv('FLASK_DEBUG', '0') in ('1', 'true', 'True', 'yes', 'YES')
-    host = os.getenv('HOST', '127.0.0.1')
-    port = int(os.getenv('PORT', '5000'))
-    app.run(debug=debug, host=host, port=port)
+    app.run(debug=False, host='127.0.0.1', port=5000)

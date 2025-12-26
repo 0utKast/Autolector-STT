@@ -1,26 +1,40 @@
 <!DOCTYPE html>
 <html lang="es">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MP4 a Texto</title>
+    <title>Autolector - Real-time Transcription</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
+
 <body>
-    <div class="container">
-        <h1>Convertir Multimedia a Texto</h1>
+    <div class="container autolector">
+        <h1>Autolector</h1>
+        <p class="subtitle">Multimedia a Texto Sincronizado</p>
+
         <form id="upload-form" enctype="multipart/form-data">
-            <input type="file" id="mp4-file" name="file" accept="video/mp4,audio/mpeg,audio/wav,audio/x-m4a,audio/mp3">
-            <button type="submit">Transcribir</button>
+            <div class="file-input-wrapper">
+                <input type="file" id="mp4-file" name="file"
+                    accept="video/mp4,audio/mpeg,audio/wav,audio/x-m4a,audio/mp3">
+                <label for="mp4-file" class="custom-file-upload">Seleccionar Archivo</label>
+            </div>
+            <button type="submit" id="submit-btn">Comenzar Lectura</button>
         </form>
+
         <div id="loading" class="hidden">
             <div class="spinner"></div>
-            <p>Transcribiendo audio, por favor espera...</p>
+            <p id="loading-msg">Procesando...</p>
         </div>
-        <div id="result" class="hidden">
-            <h2>Transcripción:</h2>
-            <pre id="transcription-text"></pre>
+
+        <div id="player-container" class="hidden">
+            <audio id="audio-player" controls></audio>
         </div>
+
+        <div id="karaoke-container" class="hidden">
+            <div id="transcription-stream" class="karaoke-view"></div>
+        </div>
+
         <div id="error" class="hidden">
             <h2>Error:</h2>
             <p id="error-message"></p>
@@ -28,124 +42,143 @@
     </div>
 
     <script>
-        let pollingInterval;
+        let eventSource;
+        const form = document.getElementById('upload-form');
+        const audioPlayer = document.getElementById('audio-player');
+        const streamContainer = document.getElementById('transcription-stream');
+        const loadingDiv = document.getElementById('loading');
+        const loadingMsg = document.getElementById('loading-msg');
+        const playerContainer = document.getElementById('player-container');
+        const karaokeContainer = document.getElementById('karaoke-container');
+        const errorDiv = document.getElementById('error');
+        const errorMessage = document.getElementById('error-message');
 
-        document.getElementById('upload-form').addEventListener('submit', async (event) => {
-            event.preventDefault();
-
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
             const fileInput = document.getElementById('mp4-file');
-            const loadingDiv = document.getElementById('loading');
-            const resultDiv = document.getElementById('result');
-            const errorDiv = document.getElementById('error');
-            const transcriptionText = document.getElementById('transcription-text');
-            const errorMessage = document.getElementById('error-message');
-            const loadingMessage = loadingDiv.querySelector('p');
+            if (fileInput.files.length === 0) return;
 
-            // Clear previous states
-            clearInterval(pollingInterval);
-            loadingDiv.classList.add('hidden');
-            resultDiv.classList.add('hidden');
+            // Reset UI
+            loadingDiv.classList.remove('hidden');
+            playerContainer.classList.add('hidden');
+            karaokeContainer.classList.add('hidden');
             errorDiv.classList.add('hidden');
-            transcriptionText.textContent = '';
-            errorMessage.textContent = '';
-            loadingMessage.textContent = 'Transcribiendo audio, por favor espera...';
-
-            if (fileInput.files.length === 0) {
-                errorMessage.textContent = 'Por favor, selecciona un archivo MP4 o de audio.';
-                errorDiv.classList.remove('hidden');
-                return;
-            }
+            streamContainer.innerHTML = '';
+            if (eventSource) eventSource.close();
 
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
 
-            loadingDiv.classList.remove('hidden');
-            loadingMessage.textContent = 'Subiendo archivo...';
-
             try {
-                const uploadResponse = await fetch('/upload', {
-                    method: 'POST',
-                    body: formData,
-                });
+                loadingMsg.textContent = 'Subiendo y preparando...';
+                const response = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await response.json();
 
-                if (!uploadResponse.ok) {
-                    const errorData = await uploadResponse.json();
-                    errorMessage.textContent = `Error al iniciar la subida: ${errorData.message || uploadResponse.statusText}`;
-                    errorDiv.classList.remove('hidden');
-                    loadingDiv.classList.add('hidden');
+                if (!response.ok) throw new Error(data.message || 'Error en la subida');
+
+                const taskId = data.task_id;
+                startStreaming(taskId);
+                checkStatus(taskId);
+
+            } catch (err) {
+                loadingDiv.classList.add('hidden');
+                errorDiv.classList.remove('hidden');
+                errorMessage.textContent = err.message;
+            }
+        });
+
+        function startStreaming(taskId) {
+            console.log("Iniciando streaming para:", taskId);
+            eventSource = new EventSource(`/stream/${taskId}`);
+
+            eventSource.onopen = () => {
+                console.log("Conexión SSE abierta para:", taskId);
+            };
+
+            eventSource.onmessage = (event) => {
+                console.log("Mensaje SSE recibido:", event.data);
+                const data = JSON.parse(event.data);
+
+                if (data.status === 'connected') {
+                    console.log("SSE Confirmado conectada");
                     return;
                 }
 
-                const responseData = await uploadResponse.json();
-                const taskId = responseData.task_id;
-                loadingMessage.textContent = `Procesando (ID: ${taskId})...`;
+                if (data.status === 'completed') {
+                    console.log("Transcripción finalizada por SSE");
+                    eventSource.close();
+                    return;
+                }
 
-                // Start polling for status
-                pollingInterval = setInterval(async () => {
-                    try {
-                        const statusResponse = await fetch(`/status/${taskId}`);
-                        if (!statusResponse.ok) {
-                            throw new Error(`HTTP error! status: ${statusResponse.status}`);
-                        }
-                        const statusData = await statusResponse.json();
+                if (data.error) {
+                    showError(data.error);
+                    eventSource.close();
+                    return;
+                }
 
-                        switch (statusData.status) {
-                            case 'received':
-                                loadingMessage.textContent = 'Archivo recibido, esperando procesamiento...';
-                                break;
-                            case 'saving_file':
-                                loadingMessage.textContent = 'Guardando archivo...';
-                                break;
-                            case 'file_saved':
-                                loadingMessage.textContent = 'Archivo guardado, preparando transcripción...';
-                                break;
-                            case 'extracting_audio':
-                                loadingMessage.textContent = 'Extrayendo audio (ffmpeg)...';
-                                break;
-                            case 'audio_extracted':
-                                loadingMessage.textContent = 'Audio extraído, iniciando transcripción...';
-                                break;
-                            case 'ready_for_transcription':
-                                loadingMessage.textContent = 'Listo para transcribir...';
-                                break;
-                            case 'transcribing':
-                                loadingMessage.textContent = 'Transcribiendo audio (whisper), esto puede tardar...';
-                                break;
-                            case 'transcription_completed':
-                                loadingMessage.textContent = 'Transcripción completada, leyendo resultado...';
-                                break;
-                            case 'reading_transcription':
-                                loadingMessage.textContent = 'Leyendo transcripción...';
-                                break;
-                            case 'completed':
-                                clearInterval(pollingInterval);
-                                transcriptionText.textContent = statusData.transcription;
-                                resultDiv.classList.remove('hidden');
-                                loadingDiv.classList.add('hidden');
-                                break;
-                            case 'error':
-                                clearInterval(pollingInterval);
-                                errorMessage.textContent = `Error en el procesamiento: ${statusData.error}`;
-                                errorDiv.classList.remove('hidden');
-                                loadingDiv.classList.add('hidden');
-                                break;
-                            default:
-                                loadingMessage.textContent = `Estado desconocido: ${statusData.status}`;
-                        }
-                    } catch (pollError) {
-                        clearInterval(pollingInterval);
-                        errorMessage.textContent = `Error al consultar estado: ${pollError.message}`;
-                        errorDiv.classList.remove('hidden');
+                // Append new segment
+                const span = document.createElement('span');
+                span.className = 'segment';
+                span.dataset.start = data.start;
+                span.dataset.end = data.end;
+                span.textContent = data.text + ' ';
+                streamContainer.appendChild(span);
+
+                // Show karaoke view if hidden
+                karaokeContainer.classList.remove('hidden');
+            };
+
+            eventSource.onerror = (err) => {
+                console.error("SSE Error:", err);
+                // eventSource.close(); // Don't close immediately, let it retry or heartbeat
+            };
+        }
+
+        async function checkStatus(taskId) {
+            const interval = setInterval(async () => {
+                const res = await fetch(`/status/${taskId}`);
+                const data = await res.json();
+
+                if (data.status === 'transcribing' || data.status === 'audio_extracted' || data.status === 'completed') {
+                    if (audioPlayer.src === "" || !audioPlayer.src.includes(`/audio/${taskId}`)) {
+                        audioPlayer.src = `/audio/${taskId}`;
+                        playerContainer.classList.remove('hidden');
                         loadingDiv.classList.add('hidden');
                     }
-                }, 2000); // Poll every 2 seconds
+                }
 
-            } catch (fetchError) {
-                errorMessage.textContent = `Error de red: ${fetchError.message}`;
-                errorDiv.classList.remove('hidden');
-                loadingDiv.classList.add('hidden');
-            }
+                if (data.status === 'completed' || data.status === 'error') {
+                    clearInterval(interval);
+                    if (data.status === 'error') showError(data.error);
+                }
+            }, 2000);
+        }
+
+        function showError(msg) {
+            errorDiv.classList.remove('hidden');
+            errorMessage.textContent = msg;
+            loadingDiv.classList.add('hidden');
+        }
+
+        // Karaoke sync logic
+        audioPlayer.addEventListener('timeupdate', () => {
+            const currentTime = audioPlayer.currentTime;
+            const segments = document.querySelectorAll('.segment');
+
+            segments.forEach(seg => {
+                const start = parseFloat(seg.dataset.start);
+                const end = parseFloat(seg.dataset.end);
+
+                if (currentTime >= start && currentTime <= end) {
+                    seg.classList.add('active');
+                    // Scroll into view if needed
+                    seg.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                } else {
+                    seg.classList.remove('active');
+                }
+            });
         });
     </script>
 </body>
+
 </html>
